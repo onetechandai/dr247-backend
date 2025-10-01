@@ -1912,6 +1912,310 @@
 //   console.log('———————————————');
 // });
 // server/meeting-server.js
+
+
+// import http from 'http';
+// import express from 'express';
+// import cors from 'cors';
+// import dotenv from 'dotenv';
+// import mongoose from 'mongoose';
+// import jwt from 'jsonwebtoken';
+// import { WebSocketServer } from 'ws';
+
+// dotenv.config();
+
+// const ENV = {
+//   PORT: Number(process.env.PORT || 5080),
+//   MONGODB_URI: process.env.MONGODB_URI,
+//   MEETING_JWT_SECRET: process.env.MEETING_JWT_SECRET,
+//   FRONTEND_URL: process.env.FRONTEND_URL || '',
+//   SIGNALING_URL: process.env.SIGNALING_URL || '',
+//   TURN_URL: process.env.TURN_URL || '',     // e.g. turns:turn.yourdomain.com:5349?transport=tcp
+//   TURN_USER: process.env.TURN_USER || '',
+//   TURN_PASS: process.env.TURN_PASS || '',
+//   CORS_ORIGINS: process.env.CORS_ORIGINS || '', // comma-separated allowlist (optional)
+//   ADMIN_EMAIL: process.env.ADMIN_EMAIL || '',
+// };
+
+// for (const k of ['MONGODB_URI', 'MEETING_JWT_SECRET']) {
+//   if (!ENV[k] || String(ENV[k]).trim() === '') throw new Error(`${k} missing`);
+// }
+
+// const app = express();
+// app.set('trust proxy', true);
+
+// const allowOrigins = (ENV.CORS_ORIGINS || '')
+//   .split(',').map(s => s.trim()).filter(Boolean);
+
+// app.use(cors({
+//   origin: (origin, cb) => {
+//     if (!origin) return cb(null, true);
+//     if (!allowOrigins.length && !ENV.FRONTEND_URL) return cb(null, true);
+//     try {
+//       const allowedSet = new Set(allowOrigins.length ? allowOrigins : [new URL(ENV.FRONTEND_URL).origin]);
+//       const o = new URL(origin).origin;
+//       return cb(null, allowedSet.has(o));
+//     } catch {
+//       return cb(null, false);
+//     }
+//   },
+//   credentials: true,
+// }));
+// app.use(express.json());
+
+// const httpServer = http.createServer(app);
+
+// await mongoose.connect(ENV.MONGODB_URI);
+// console.log('✅ MongoDB connected');
+
+// const { Schema, model, models } = mongoose;
+
+// const ParticipantSchema = new Schema({
+//   email: { type: String, required: true, lowercase: true, trim: true },
+//   role:  { type: String, enum: ['patient','doctor','admin'], required: true },
+// }, { _id: false });
+
+// const MeetingSchema = new Schema({
+//   code: { type: String, required: true, index: { unique: true } },
+//   appointmentId: { type: String },
+//   participants: { type: [ParticipantSchema], default: [] },
+//   status: { type: String, enum: ['Scheduled','Live','Ended'], default: 'Scheduled' },
+// }, { timestamps: true });
+
+// const Meeting = models.Meeting || model('Meeting', MeetingSchema);
+
+// const lower = (x) => String(x || '').trim().toLowerCase();
+// const genCode = () => String(Math.floor(100000 + Math.random() * 900000));
+// async function genUniqueCode() {
+//   for (let i = 0; i < 14; i++) {
+//     const c = genCode();
+//     const exists = await Meeting.exists({ code: c });
+//     if (!exists) return c;
+//   }
+//   throw new Error('Could not generate unique meeting code');
+// }
+// const sign = (payload, expSec = 3600) =>
+//   jwt.sign(payload, ENV.MEETING_JWT_SECRET, { expiresIn: expSec });
+
+// function buildIceServers() {
+//   const ice = [{ urls: ['stun:stun.l.google.com:19302'] }];
+//   if (ENV.TURN_URL && ENV.TURN_USER && ENV.TURN_PASS) {
+//     ice.push({ urls: [ENV.TURN_URL], username: ENV.TURN_USER, credential: ENV.TURN_PASS });
+//   }
+//   return ice;
+// }
+// function getFrontendOrigin(req) {
+//   if (ENV.FRONTEND_URL) {
+//     try { return new URL(ENV.FRONTEND_URL).origin; } catch {}
+//   }
+//   const proto = req.get('x-forwarded-proto') || (req.secure ? 'https' : 'http');
+//   const host = req.get('x-forwarded-host') || req.get('host');
+//   return `${proto}://${host}`;
+// }
+// function getSignalingUrl(req) {
+//   if (ENV.SIGNALING_URL) return ENV.SIGNALING_URL;
+//   const isHttps = (req.get('x-forwarded-proto') || '').includes('https') || req.secure;
+//   const host = req.get('x-forwarded-host') || req.get('host');
+//   return `${isHttps ? 'wss' : 'ws'}://${host}/ws`;
+// }
+
+// app.get('/', (_req, res) => res.send('Meeting backend up ✅'));
+// app.get('/healthz', (req, res) => res.json({
+//   ok: true,
+//   env: {
+//     port: ENV.PORT,
+//     hasFrontendUrl: !!ENV.FRONTEND_URL,
+//     hasSignalingOverride: !!ENV.SIGNALING_URL,
+//     hasTurn: !!(ENV.TURN_URL && ENV.TURN_USER && ENV.TURN_PASS),
+//   },
+//   ip: req.ip,
+// }));
+
+// app.post('/api/meetings/create', async (req, res) => {
+//   try {
+//     const { appointmentId, patientEmail, doctorEmail } = req.body || {};
+//     if (!patientEmail || !doctorEmail) {
+//       return res.status(400).json({ error: 'patientEmail and doctorEmail required' });
+//     }
+//     const code = await genUniqueCode();
+//     const participants = [
+//       { email: lower(patientEmail), role: 'patient' },
+//       { email: lower(doctorEmail),  role: 'doctor'  },
+//     ];
+//     if (ENV.ADMIN_EMAIL && !participants.some(p => p.email === lower(ENV.ADMIN_EMAIL))) {
+//       participants.push({ email: lower(ENV.ADMIN_EMAIL), role: 'admin' });
+//     }
+//     const meeting = await Meeting.create({ code, appointmentId: appointmentId || null, participants });
+
+//     const origin = getFrontendOrigin(req);
+//     const mk = (r, e) => `${origin.replace(/\/$/, '')}/meeting/${code}?role=${r}&email=${encodeURIComponent(lower(e))}`;
+//     res.json({
+//       code,
+//       meetingId: meeting._id,
+//       patientUrl: mk('patient', patientEmail),
+//       doctorUrl:  mk('doctor', doctorEmail),
+//       adminUrl:   ENV.ADMIN_EMAIL ? mk('admin', ENV.ADMIN_EMAIL) : null,
+//     });
+//   } catch (e) {
+//     if (e?.code === 11000) return res.status(409).json({ error: 'Code collision, retry' });
+//     res.status(400).json({ error: e?.message || 'Create failed' });
+//   }
+// });
+
+// app.post('/api/meetings/verify', async (req, res) => {
+//   try {
+//     const { code, email, role } = req.body || {};
+//     if (!code || !email || !role) return res.status(400).json({ error: 'code, email, role required' });
+//     if (!['patient','doctor','admin'].includes(role)) return res.status(400).json({ error: 'Invalid role' });
+
+//     const meeting = await Meeting.findOne({ code });
+//     if (!meeting) return res.status(400).json({ error: 'Invalid meeting code' });
+//     if (meeting.status === 'Ended') return res.status(403).json({ error: 'Meeting ended' });
+
+//     const e = lower(email);
+//     let p = meeting.participants.find(p => p.email === e);
+//     if (!p) {
+//       const MAX = 16;
+//       if (meeting.participants.length >= MAX) return res.status(403).json({ error: 'Room is full' });
+//       meeting.participants.push({ email: e, role });
+//       await meeting.save();
+//       p = { email: e, role };
+//     }
+//     if ((p.role === 'doctor' || p.role === 'admin') && meeting.status === 'Scheduled') {
+//       meeting.status = 'Live'; await meeting.save();
+//     }
+
+//     const token = sign({ code, email: e, role: p.role }, 60 * 60);
+//     const signalingUrl = getSignalingUrl(req);
+
+//     res.json({
+//       token,
+//       iceServers: buildIceServers(),
+//       signalingUrl,
+//       appointmentId: meeting.appointmentId || null,
+//       role: p.role,
+//     });
+//   } catch (e) {
+//     res.status(400).json({ error: e?.message || 'Verify failed' });
+//   }
+// });
+
+// /* ---------- WebSocket Signaling ---------- */
+// const wss = new WebSocketServer({ noServer: true });
+// const rooms = new Map(); // code -> Map(email -> ws)
+
+// function getRoom(code) { if (!rooms.has(code)) rooms.set(code, new Map()); return rooms.get(code); }
+// function joinRoom(code, email, role, ws) {
+//   const room = getRoom(code);
+//   room.set(email, ws);
+//   ws._room = code; ws._email = email; ws._role = role; ws._authed = true;
+// }
+// function leaveRoom(ws) {
+//   const code = ws._room; const email = ws._email;
+//   if (!code) return;
+//   const room = rooms.get(code);
+//   if (!room) return;
+//   room.delete(email);
+//   if (room.size === 0) rooms.delete(code);
+// }
+// function broadcastToRoom(code, payload, exceptEmail=null) {
+//   const room = rooms.get(code); if (!room) return;
+//   for (const [email, peer] of room.entries()) {
+//     if (exceptEmail && email === exceptEmail) continue;
+//     if (peer.readyState === 1) { try { peer.send(JSON.stringify(payload)); } catch {} }
+//   }
+// }
+
+// wss.on('connection', (ws) => {
+//   ws.isAlive = true;
+//   const authTimer = setTimeout(() => { if (!ws._authed) try { ws.close(4001, 'no-auth'); } catch {} }, 6000);
+//   ws.on('pong', () => { ws.isAlive = true; });
+
+//   ws.on('message', async (raw) => {
+//     let msg; try { msg = JSON.parse(raw); } catch { return; }
+
+//     if (!ws._authed) {
+//       if (msg.type !== 'auth' || !msg.token) return;
+//       try {
+//         const { code, email, role, exp } = jwt.verify(msg.token, ENV.MEETING_JWT_SECRET);
+//         const meeting = await Meeting.findOne({ code });
+//         if (!meeting) throw new Error('bad-meeting');
+//         const allowed = meeting.participants.some(p => p.email === email && p.role === role);
+//         if (!allowed) throw new Error('bad-user');
+
+//         joinRoom(code, email, role, ws);
+//         ws.send(JSON.stringify({ type: 'auth-ok', you: { code, email, role, exp } }));
+//         broadcastToRoom(code, { type: 'room:join', email, role }, email);
+//       } catch {
+//         ws.send(JSON.stringify({ type: 'auth-error' })); try { ws.close(4002, 'bad-token'); } catch {}
+//       }
+//       clearTimeout(authTimer);
+//       return;
+//     }
+
+//     const code = ws._room; const room = rooms.get(code); if (!room) return;
+//     const sendTo = (toEmail, payload) => {
+//       const peer = room.get(toEmail);
+//       if (peer && peer.readyState === 1) {
+//         try { peer.send(JSON.stringify({ ...payload, fromEmail: ws._email, fromRole: ws._role })); } catch {}
+//       }
+//     };
+
+//     switch (msg.type) {
+//       case 'room:who': {
+//         const roster = [];
+//         for (const [email, peer] of room.entries()) {
+//           roster.push({ email, role: peer._role, online: peer.readyState === 1 });
+//         }
+//         ws.send(JSON.stringify({ type: 'room:roster', roster }));
+//         break;
+//       }
+//       case 'rtc:offer': {
+//         if (!msg.toEmail || !msg.sdp) return;
+//         sendTo(msg.toEmail, { type: 'offer', sdp: msg.sdp });
+//         break;
+//       }
+//       case 'rtc:answer': {
+//         if (!msg.toEmail || !msg.sdp) return;
+//         sendTo(msg.toEmail, { type: 'answer', sdp: msg.sdp });
+//         break;
+//       }
+//       case 'rtc:candidate': {
+//         if (!msg.toEmail || !msg.candidate) return;
+//         sendTo(msg.toEmail, { type: 'candidate', candidate: msg.candidate });
+//         break;
+//       }
+//     }
+//   });
+
+//   ws.on('close', () => {
+//     const code = ws._room; const email = ws._email;
+//     leaveRoom(ws);
+//     if (code && email) broadcastToRoom(code, { type: 'room:leave', email });
+//   });
+// });
+
+// httpServer.on('upgrade', (req, socket, head) => {
+//   if (!req.url || !req.url.startsWith('/ws')) { socket.destroy(); return; }
+//   wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
+// });
+
+// setInterval(() => {
+//   wss.clients.forEach((ws) => {
+//     if (!ws.isAlive) return ws.terminate();
+//     ws.isAlive = false;
+//     try { ws.ping(); } catch {}
+//   });
+// }, 15000);
+
+// httpServer.listen(ENV.PORT, () => {
+//   console.log('——— Meeting Server ———');
+//   console.log(`HTTP/WS Port : ${ENV.PORT}`);
+//   console.log(`Frontend URL : ${ENV.FRONTEND_URL || '(auto from request)'}`);
+//   console.log(`Signaling URL: ${ENV.SIGNALING_URL || '(auto per-request)'}`);
+//   console.log(`TURN Enabled : ${ENV.TURN_URL && ENV.TURN_USER && ENV.TURN_PASS ? 'yes' : 'no'}`);
+//   console.log('———————————————');
+// });
 import http from 'http';
 import express from 'express';
 import cors from 'cors';
@@ -1919,6 +2223,7 @@ import dotenv from 'dotenv';
 import mongoose from 'mongoose';
 import jwt from 'jsonwebtoken';
 import { WebSocketServer } from 'ws';
+import helmet from 'helmet';
 
 dotenv.config();
 
@@ -1932,7 +2237,8 @@ const ENV = {
   TURN_USER: process.env.TURN_USER || '',
   TURN_PASS: process.env.TURN_PASS || '',
   CORS_ORIGINS: process.env.CORS_ORIGINS || '', // comma-separated allowlist (optional)
-  ADMIN_EMAIL: process.env.ADMIN_EMAIL || '',
+  ADMIN_EMAIL: (process.env.ADMIN_EMAIL || '').toLowerCase(),
+  ROOM_CAPACITY: Number(process.env.ROOM_CAPACITY || 16),
 };
 
 for (const k of ['MONGODB_URI', 'MEETING_JWT_SECRET']) {
@@ -1941,24 +2247,29 @@ for (const k of ['MONGODB_URI', 'MEETING_JWT_SECRET']) {
 
 const app = express();
 app.set('trust proxy', true);
+app.use(helmet({ crossOriginEmbedderPolicy: false, contentSecurityPolicy: false }));
 
 const allowOrigins = (ENV.CORS_ORIGINS || '')
-  .split(',').map(s => s.trim()).filter(Boolean);
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
 
-app.use(cors({
-  origin: (origin, cb) => {
-    if (!origin) return cb(null, true);
-    if (!allowOrigins.length && !ENV.FRONTEND_URL) return cb(null, true);
-    try {
-      const allowedSet = new Set(allowOrigins.length ? allowOrigins : [new URL(ENV.FRONTEND_URL).origin]);
-      const o = new URL(origin).origin;
-      return cb(null, allowedSet.has(o));
-    } catch {
-      return cb(null, false);
-    }
-  },
-  credentials: true,
-}));
+app.use(
+  cors({
+    origin: (origin, cb) => {
+      if (!origin) return cb(null, true);
+      if (!allowOrigins.length && !ENV.FRONTEND_URL) return cb(null, true);
+      try {
+        const allowedSet = new Set(allowOrigins.length ? allowOrigins : [new URL(ENV.FRONTEND_URL).origin]);
+        const o = new URL(origin).origin;
+        return cb(null, allowedSet.has(o));
+      } catch {
+        return cb(null, false);
+      }
+    },
+    credentials: true,
+  })
+);
 app.use(express.json());
 
 const httpServer = http.createServer(app);
@@ -1968,17 +2279,23 @@ console.log('✅ MongoDB connected');
 
 const { Schema, model, models } = mongoose;
 
-const ParticipantSchema = new Schema({
-  email: { type: String, required: true, lowercase: true, trim: true },
-  role:  { type: String, enum: ['patient','doctor','admin'], required: true },
-}, { _id: false });
+const ParticipantSchema = new Schema(
+  {
+    email: { type: String, required: true, lowercase: true, trim: true },
+    role: { type: String, enum: ['patient', 'doctor', 'admin'], required: true },
+  },
+  { _id: false }
+);
 
-const MeetingSchema = new Schema({
-  code: { type: String, required: true, index: { unique: true } },
-  appointmentId: { type: String },
-  participants: { type: [ParticipantSchema], default: [] },
-  status: { type: String, enum: ['Scheduled','Live','Ended'], default: 'Scheduled' },
-}, { timestamps: true });
+const MeetingSchema = new Schema(
+  {
+    code: { type: String, required: true, index: { unique: true } },
+    appointmentId: { type: String },
+    participants: { type: [ParticipantSchema], default: [] },
+    status: { type: String, enum: ['Scheduled', 'Live', 'Ended'], default: 'Scheduled' },
+  },
+  { timestamps: true }
+);
 
 const Meeting = models.Meeting || model('Meeting', MeetingSchema);
 
@@ -1992,8 +2309,7 @@ async function genUniqueCode() {
   }
   throw new Error('Could not generate unique meeting code');
 }
-const sign = (payload, expSec = 3600) =>
-  jwt.sign(payload, ENV.MEETING_JWT_SECRET, { expiresIn: expSec });
+const sign = (payload, expSec = 3600) => jwt.sign(payload, ENV.MEETING_JWT_SECRET, { expiresIn: expSec });
 
 function buildIceServers() {
   const ice = [{ urls: ['stun:stun.l.google.com:19302'] }];
@@ -2018,17 +2334,21 @@ function getSignalingUrl(req) {
 }
 
 app.get('/', (_req, res) => res.send('Meeting backend up ✅'));
-app.get('/healthz', (req, res) => res.json({
-  ok: true,
-  env: {
-    port: ENV.PORT,
-    hasFrontendUrl: !!ENV.FRONTEND_URL,
-    hasSignalingOverride: !!ENV.SIGNALING_URL,
-    hasTurn: !!(ENV.TURN_URL && ENV.TURN_USER && ENV.TURN_PASS),
-  },
-  ip: req.ip,
-}));
+app.get('/healthz', (req, res) =>
+  res.json({
+    ok: true,
+    env: {
+      port: ENV.PORT,
+      hasFrontendUrl: !!ENV.FRONTEND_URL,
+      hasSignalingOverride: !!ENV.SIGNALING_URL,
+      hasTurn: !!(ENV.TURN_URL && ENV.TURN_USER && ENV.TURN_PASS),
+      roomCapacity: ENV.ROOM_CAPACITY,
+    },
+    ip: req.ip,
+  })
+);
 
+// Create meeting from appointment
 app.post('/api/meetings/create', async (req, res) => {
   try {
     const { appointmentId, patientEmail, doctorEmail } = req.body || {};
@@ -2038,9 +2358,9 @@ app.post('/api/meetings/create', async (req, res) => {
     const code = await genUniqueCode();
     const participants = [
       { email: lower(patientEmail), role: 'patient' },
-      { email: lower(doctorEmail),  role: 'doctor'  },
+      { email: lower(doctorEmail), role: 'doctor' },
     ];
-    if (ENV.ADMIN_EMAIL && !participants.some(p => p.email === lower(ENV.ADMIN_EMAIL))) {
+    if (ENV.ADMIN_EMAIL && !participants.some((p) => p.email === lower(ENV.ADMIN_EMAIL))) {
       participants.push({ email: lower(ENV.ADMIN_EMAIL), role: 'admin' });
     }
     const meeting = await Meeting.create({ code, appointmentId: appointmentId || null, participants });
@@ -2051,8 +2371,8 @@ app.post('/api/meetings/create', async (req, res) => {
       code,
       meetingId: meeting._id,
       patientUrl: mk('patient', patientEmail),
-      doctorUrl:  mk('doctor', doctorEmail),
-      adminUrl:   ENV.ADMIN_EMAIL ? mk('admin', ENV.ADMIN_EMAIL) : null,
+      doctorUrl: mk('doctor', doctorEmail),
+      adminUrl: ENV.ADMIN_EMAIL ? mk('admin', ENV.ADMIN_EMAIL) : null,
     });
   } catch (e) {
     if (e?.code === 11000) return res.status(409).json({ error: 'Code collision, retry' });
@@ -2060,27 +2380,28 @@ app.post('/api/meetings/create', async (req, res) => {
   }
 });
 
+// Verify & join token
 app.post('/api/meetings/verify', async (req, res) => {
   try {
     const { code, email, role } = req.body || {};
     if (!code || !email || !role) return res.status(400).json({ error: 'code, email, role required' });
-    if (!['patient','doctor','admin'].includes(role)) return res.status(400).json({ error: 'Invalid role' });
+    if (!['patient', 'doctor', 'admin'].includes(role)) return res.status(400).json({ error: 'Invalid role' });
 
     const meeting = await Meeting.findOne({ code });
     if (!meeting) return res.status(400).json({ error: 'Invalid meeting code' });
     if (meeting.status === 'Ended') return res.status(403).json({ error: 'Meeting ended' });
 
     const e = lower(email);
-    let p = meeting.participants.find(p => p.email === e);
+    let p = meeting.participants.find((p) => p.email === e);
     if (!p) {
-      const MAX = 16;
-      if (meeting.participants.length >= MAX) return res.status(403).json({ error: 'Room is full' });
+      if (meeting.participants.length >= ENV.ROOM_CAPACITY) return res.status(403).json({ error: 'Room is full' });
       meeting.participants.push({ email: e, role });
       await meeting.save();
       p = { email: e, role };
     }
     if ((p.role === 'doctor' || p.role === 'admin') && meeting.status === 'Scheduled') {
-      meeting.status = 'Live'; await meeting.save();
+      meeting.status = 'Live';
+      await meeting.save();
     }
 
     const token = sign({ code, email: e, role: p.role }, 60 * 60);
@@ -2098,6 +2419,26 @@ app.post('/api/meetings/verify', async (req, res) => {
   }
 });
 
+// End meeting (admin/doctor — call from your admin API)
+app.post('/api/meetings/end', async (req, res) => {
+  try {
+    const { code } = req.body || {};
+    const m = await Meeting.findOne({ code });
+    if (!m) return res.status(404).json({ error: 'Not found' });
+    m.status = 'Ended';
+    await m.save();
+    const room = rooms.get(code);
+    if (room) {
+      for (const [, peer] of room.entries()) {
+        try { peer.send(JSON.stringify({ type: 'room:ended' })); } catch {}
+        try { peer.close(1000, 'ended'); } catch {}
+      }
+      rooms.delete(code);
+    }
+    res.json({ ok: true });
+  } catch (e) { res.status(400).json({ error: e?.message || 'Failed' }); }
+});
+
 /* ---------- WebSocket Signaling ---------- */
 const wss = new WebSocketServer({ noServer: true });
 const rooms = new Map(); // code -> Map(email -> ws)
@@ -2106,7 +2447,7 @@ function getRoom(code) { if (!rooms.has(code)) rooms.set(code, new Map()); retur
 function joinRoom(code, email, role, ws) {
   const room = getRoom(code);
   room.set(email, ws);
-  ws._room = code; ws._email = email; ws._role = role; ws._authed = true;
+  ws._room = code; ws._email = email; ws._role = role; ws._authed = true; ws.isAlive = true;
 }
 function leaveRoom(ws) {
   const code = ws._room; const email = ws._email;
@@ -2116,16 +2457,15 @@ function leaveRoom(ws) {
   room.delete(email);
   if (room.size === 0) rooms.delete(code);
 }
-function broadcastToRoom(code, payload, exceptEmail=null) {
+function broadcastToRoom(code, payload, exceptEmail = null) {
   const room = rooms.get(code); if (!room) return;
-  for (const [email, peer] of room.entries()) {
-    if (exceptEmail && email === exceptEmail) continue;
+  for (const [em, peer] of room.entries()) {
+    if (exceptEmail && em === exceptEmail) continue;
     if (peer.readyState === 1) { try { peer.send(JSON.stringify(payload)); } catch {} }
   }
 }
 
 wss.on('connection', (ws) => {
-  ws.isAlive = true;
   const authTimer = setTimeout(() => { if (!ws._authed) try { ws.close(4001, 'no-auth'); } catch {} }, 6000);
   ws.on('pong', () => { ws.isAlive = true; });
 
@@ -2135,14 +2475,14 @@ wss.on('connection', (ws) => {
     if (!ws._authed) {
       if (msg.type !== 'auth' || !msg.token) return;
       try {
-        const { code, email, role, exp } = jwt.verify(msg.token, ENV.MEETING_JWT_SECRET);
+        const { code, email, role } = jwt.verify(msg.token, ENV.MEETING_JWT_SECRET);
         const meeting = await Meeting.findOne({ code });
         if (!meeting) throw new Error('bad-meeting');
-        const allowed = meeting.participants.some(p => p.email === email && p.role === role);
+        const allowed = meeting.participants.some((p) => p.email === email && p.role === role);
         if (!allowed) throw new Error('bad-user');
 
         joinRoom(code, email, role, ws);
-        ws.send(JSON.stringify({ type: 'auth-ok', you: { code, email, role, exp } }));
+        ws.send(JSON.stringify({ type: 'auth-ok', you: { code, email, role } }));
         broadcastToRoom(code, { type: 'room:join', email, role }, email);
       } catch {
         ws.send(JSON.stringify({ type: 'auth-error' })); try { ws.close(4002, 'bad-token'); } catch {}
@@ -2162,9 +2502,7 @@ wss.on('connection', (ws) => {
     switch (msg.type) {
       case 'room:who': {
         const roster = [];
-        for (const [email, peer] of room.entries()) {
-          roster.push({ email, role: peer._role, online: peer.readyState === 1 });
-        }
+        for (const [email, peer] of room.entries()) roster.push({ email, role: peer._role, online: peer.readyState === 1 });
         ws.send(JSON.stringify({ type: 'room:roster', roster }));
         break;
       }
@@ -2198,6 +2536,7 @@ httpServer.on('upgrade', (req, socket, head) => {
   wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
 });
 
+// Heartbeat
 setInterval(() => {
   wss.clients.forEach((ws) => {
     if (!ws.isAlive) return ws.terminate();
@@ -2212,5 +2551,6 @@ httpServer.listen(ENV.PORT, () => {
   console.log(`Frontend URL : ${ENV.FRONTEND_URL || '(auto from request)'}`);
   console.log(`Signaling URL: ${ENV.SIGNALING_URL || '(auto per-request)'}`);
   console.log(`TURN Enabled : ${ENV.TURN_URL && ENV.TURN_USER && ENV.TURN_PASS ? 'yes' : 'no'}`);
+  console.log(`Room Capacity: ${ENV.ROOM_CAPACITY}`);
   console.log('———————————————');
 });
