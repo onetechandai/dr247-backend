@@ -3715,25 +3715,14 @@ class MeetingServer {
   middleware() {
     this.app.use(helmet({ crossOriginEmbedderPolicy: false, contentSecurityPolicy: false }));
 
-    const allowOrigins = (ENV.CORS_ORIGINS || '')
-      .split(',')
-      .map(s => s.trim())
-      .filter(Boolean);
-
+    // CORS - Allow ALL origins (no restrictions)
     this.app.use(cors({
-      origin: (origin, cb) => {
-        if (!origin) return cb(null, true);
-        try {
-          const allowed = new Set(allowOrigins.length ? allowOrigins : [new URL(ENV.FRONTEND_URL).origin]);
-          const reqOrigin = new URL(origin).origin;
-          cb(null, allowed.has(reqOrigin));
-        } catch { cb(null, false); }
-      },
+      origin: true, // Allow all origins
       credentials: true,
     }));
 
-    this.app.use(express.json({ limit: '10mb' }));
-    this.app.use(express.urlencoded({ extended: true }));
+    this.app.use(express.json({ limit: '100mb' })); // Increased limit
+    this.app.use(express.urlencoded({ extended: true, limit: '100mb' }));
   }
 
   routes() {
@@ -3797,45 +3786,54 @@ class MeetingServer {
 
       const meeting = await Meeting.findOne({ code });
       if (!meeting) return res.status(404).json({ error: 'Meeting not found' });
-      if (meeting.status === 'Ended') return res.status(403).json({ error: 'Meeting has ended' });
-
+      // STRICT SECURITY: Only pre-authorized participants can join
       const norm = this.ne(email);
-      let p = meeting.participants.find(x => x.email === norm);
-      if (!p) {
-        if (meeting.participants.length >= ENV.ROOM_CAPACITY) return res.status(403).json({ error: `Room is full (max ${ENV.ROOM_CAPACITY})` });
-        meeting.participants.push({ email: norm, role });
-        await meeting.save();
-        p = { email: norm, role };
+      const participant = meeting.participants.find(x => x.email === norm && x.role === role);
+      
+      if (!participant) {
+        this.log('[verify] UNAUTHORIZED ACCESS DENIED:', { code, email: norm, role });
+        return res.status(403).json({ 
+          ok: false, 
+          error: 'Access denied: You are not authorized to join this meeting.',
+          message: 'Only invited participants can join. Please check your email and role.'
+        });
       }
 
-      if ((role === 'doctor' || role === 'admin') && meeting.status === 'Scheduled') {
+      this.log('[verify] AUTHORIZED ACCESS:', { code, email: norm, role });
+
+      // Automatically set meeting to Live when authorized user joins
+      if (meeting.status === 'Scheduled') {
         meeting.status = 'Live';
         meeting.startedAt = new Date();
         await meeting.save();
       }
 
-      const token = jwt.sign({ code, email: norm, role: p.role }, ENV.MEETING_JWT_SECRET, { expiresIn: '2h' });
+      const token = jwt.sign({ code, email: norm, role: participant.role }, ENV.MEETING_JWT_SECRET, { expiresIn: '24h' });
       const signalingUrl = this.signalingUrl(req);
 
-      this.log('[verify] OK', { code, role: p.role, signalingUrl });
+      this.log('[verify] AUTHORIZED USER', { code, email: norm, role: participant.role, signalingUrl });
 
       res.json({
         ok: true,
         token,
-        role: p.role,
+        role: participant.role,
         signalingUrl,
         iceServers: this.iceServers(),
         meeting: {
           code: meeting.code,
           status: meeting.status,
           participants: meeting.participants.length,
-          maxParticipants: ENV.ROOM_CAPACITY,
+          authorizedOnly: true, // Strict security enabled
           expiresAt: meeting.expiresAt,
         },
       });
     } catch (e) {
-      this.log('[verify] error:', e.message);
-      res.status(400).json({ error: e.message });
+      this.log('[verify] ERROR:', e.message);
+      return res.status(500).json({ 
+        ok: false, 
+        error: 'Meeting verification failed',
+        message: e.message 
+      });
     }
   }
 
@@ -3909,11 +3907,10 @@ class MeetingServer {
   wsConn(ws, req) {
     ws.isAlive = true;
     const ip = req.socket?.remoteAddress || 'unknown';
-    this.log('[ws] connect', ip);
+    this.log('[ws] connect - NO RESTRICTIONS', ip);
 
-    const authTimeout = setTimeout(() => {
-      if (!ws._authed) { try { ws.close(4001, 'Auth timeout'); } catch {} }
-    }, 15000);
+    // REMOVED: Auth timeout - allow unlimited time to authenticate
+    const authTimeout = null;
 
     ws.on('pong', () => { ws.isAlive = true; });
 
@@ -3928,37 +3925,48 @@ class MeetingServer {
     });
 
     ws.on('close', () => {
-      clearTimeout(authTimeout);
+      if (authTimeout) clearTimeout(authTimeout);
       this.wsLeave(ws);
     });
 
     ws.on('error', () => {
-      clearTimeout(authTimeout);
+      if (authTimeout) clearTimeout(authTimeout);
       this.wsLeave(ws);
     });
   }
 
   async wsAuth(ws, token) {
     try {
+      // Verify token
       const { code, email, role } = jwt.verify(token, ENV.MEETING_JWT_SECRET);
+      
+      // STRICT: Verify meeting exists and user is authorized
       const meeting = await Meeting.findOne({ code });
-      if (!meeting) throw new Error('Meeting not found');
-      if (meeting.status === 'Ended') throw new Error('Meeting ended');
-
-      let p = meeting.participants.find(x => x.email === email && x.role === role);
-      if (!p) {
-        if (meeting.participants.length >= ENV.ROOM_CAPACITY) throw new Error('Room full');
-        meeting.participants.push({ email, role });
-        await meeting.save();
+      if (!meeting) {
+        this.log('[wsAuth] DENIED - Meeting not found:', code);
+        ws.send(JSON.stringify({ type: 'auth-error', message: 'Meeting not found' }));
+        return ws.close(4001, 'Meeting not found');
       }
+
+      // STRICT: Check if user is in participants list
+      const participant = meeting.participants.find(x => x.email === email && x.role === role);
+      if (!participant) {
+        this.log('[wsAuth] DENIED - Unauthorized user:', { email, role, code });
+        ws.send(JSON.stringify({ type: 'auth-error', message: 'Unauthorized: Not in participants list' }));
+        return ws.close(4003, 'Unauthorized');
+      }
+
+      this.log('[wsAuth] AUTHORIZED:', { code, email, role });
 
       // Room slot
       if (!this.rooms.has(code)) this.rooms.set(code, new Map());
       const room = this.rooms.get(code);
 
-      // replace old socket (self-reconnect)
+      // Replace old socket (self-reconnect)
       const old = room.get(email);
-      if (old && old !== ws) { try { old.close(4000, 'Reconnected'); } catch {} }
+      if (old && old !== ws) { 
+        try { old.close(4000, 'Reconnected'); } catch {} 
+      }
 
       room.set(email, ws);
       ws._authed = true;
@@ -3968,10 +3976,11 @@ class MeetingServer {
       ws.joinedAt = new Date();
 
       ws.send(JSON.stringify({ type: 'auth-ok', user: { code, email, role } }));
-      // notify others
+      // Notify others
       this.broadcast(room, { type: 'room:join', email, role, ts: Date.now() }, email);
     } catch (e) {
-      ws.send(JSON.stringify({ type: 'auth-error', message: e.message }));
+      this.log('[wsAuth] ERROR:', e.message);
+      ws.send(JSON.stringify({ type: 'auth-error', message: 'Invalid token or unauthorized' }));
       try { ws.close(4002, 'Auth failed'); } catch {}
     }
   }
@@ -4010,11 +4019,22 @@ class MeetingServer {
         break;
       }
 
+      case 'typing': {
+        // Broadcast typing indicator to all peers
+        this.broadcast(room, { 
+          type: 'typing', 
+          from: ws.email, 
+          isTyping: !!msg.isTyping 
+        }, ws.email);
+        break;
+      }
+
       case 'ping':
         ws.send(JSON.stringify({ type: 'pong' }));
         break;
 
       default:
+        console.log('[WS] Unknown message type:', msg.type);
         break;
     }
   }
